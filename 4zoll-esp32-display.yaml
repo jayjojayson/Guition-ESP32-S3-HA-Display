@@ -1,0 +1,1911 @@
+# =============================================================================
+#  4Zoll-ESP32-Display  ·  Guition ESP32-S3-4848S040 (JC4848W540) · 480x480
+#  Modernes Raumdisplay für Home Assistant über ESPHome + LVGL
+# -----------------------------------------------------------------------------
+#  START (Screensaver, ohne Menü):  Uhrzeit · Hausverbrauch · Außentemp · Batterie-SoC
+#  Antippen  -> Seite "Licht" (8 Schalter)
+#  Bottom-Menü verbindet:  Home · Licht · Wetter · Energie
+#
+#  ── ZUM FLASHEN / CH340 ──────────────────────────────────────────────────────
+#  Das Board hat einen CH340-USB-Chip. Für den ERSTEN Flash per USB-C an den Mac
+#  brauchst du den CH340-Treiber. macOS bringt oft
+#  einen CH34x-Treiber mit, der Hersteller-Treiber ist aber zuverlässiger.
+#  Erster Flash: Display per USB-C anstecken -> in HA ESPHome "Install" ->
+#  "Plug into this computer" (bzw. web.esphome.io in Chrome/Edge). Danach läuft
+#  alles per OTA über WLAN, dann ist kein USB oder Treiber nötig.
+#
+#  ── ANPASSEN ─────────────────────────────────────────────────────────────────
+#  Alle mit  # <-- ENTITY  markierten entity_id / action-Ziele auf deine echten
+#  Home-Assistant-Entitäten ändern (Growatt-Solar, Victron-Batterie, Homematic …).
+#  Umlaute in festen Labels: die Standard-Fonts enthalten KEINE ä/ö/ü/ß. Wenn du
+#  ein Label mit Umlaut brauchst, den Buchstaben unter dem jeweiligen font: in
+#  "glyphs:" ergänzen (deshalb sind Default-Labels umlautfrei gehalten).
+# =============================================================================
+
+substitutions:
+  name: "4zoll-esp32-display"
+  friendly_name: "4Zoll-ESP32-Display"
+  # ---- Farbschema (zentral änderbar) -----------------------------------------
+  c_bg: "0x0A0E17"        # Hintergrund
+  c_card: "0x151B26"      # Kartenfläche
+  c_card_on: "0x243447"   # Karte "aktiv" (Licht an)
+  c_text: "0xF3F6FC"      # Text hell
+  c_muted: "0x7E8AA0"     # Text gedämpft
+  c_cyan: "0x35D0E8"      # Akzent Uhr/Temp
+  c_blue: "0x5B8DEF"      # Akzent Leistung
+  c_green: "0x38D39F"     # Akzent Batterie
+  c_amber: "0xF6B93B"     # Akzent Solar/Licht
+  c_orange: "0xFF8A5B"    # Akzent Verbrauch
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+# --- PSRAM (Framebuffer für das RGB-Panel) ------------------------------------
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+# WICHTIG: deinen bestehenden API-Key des in HA angelegten Geräts eintragen,
+# sonst wird das Gerät als neu erkannt. (Am besten in secrets.yaml auslagern.)
+api:
+  encryption:
+    key: xxxx                  # <-- deinen echten API-Key wieder eintragen
+
+ota:
+  - platform: esphome
+    password: "5e68ede02d03f6d7f0710b7d5a5827f2"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "4Zoll-ESP32-Dis Fallback"
+    password: xxxx                  # <-- dein Fallback-Passwort wieder eintragen
+
+captive_portal:
+
+# =============================================================================
+#  TEMPERATURVERLAUF (12 h) fuer die Wetterseite
+#  Alle 30 min wird die Aussentemp gesampelt -> 24 Punkte = 12 h.
+#  Der Verlauf fuellt sich also erst ueber 12 h komplett.
+# =============================================================================
+globals:
+  - id: g_thist
+    type: float[8]
+    restore_value: no
+  - id: g_tcount
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: g_bright
+    type: int
+    restore_value: yes
+    initial_value: "100"
+  - id: g_dim
+    type: int
+    restore_value: no          
+    initial_value: "20"
+  - id: g_settemp
+    type: float
+    restore_value: no
+    initial_value: "21.0"
+  - id: g_timeout
+    type: int
+    restore_value: no          
+    initial_value: "30"
+  - id: g_lastact
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: g_saver
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # wird nach dem ersten Interval-Tick true -> LVGL ist dann sicher initialisiert
+  - id: g_lvgl_ready
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+interval:
+  # Temperaturverlauf: alle 90 min ein Schritt -> 8 Punkte = 12 h
+  # (zum Testen ruhig auf z. B. 2min stellen)
+  - interval: 90min
+    then:
+      - lambda: |-
+          float v = id(outside_temp).state;
+          if (isnan(v)) return;
+          for (int i = 1; i < 8; i++) id(g_thist)[i-1] = id(g_thist)[i];
+          id(g_thist)[7] = v;
+      - script.execute: redraw_chart
+  # Screensaver-Timer (Sekunden ueber g_timeout einstellbar)
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: "return !id(g_lvgl_ready);"
+          then:
+            - lambda: "id(g_lvgl_ready) = true;"
+      - if:
+          condition:
+            lambda: "return !id(g_saver) && (millis() - id(g_lastact)) > (uint32_t)(id(g_timeout) * 1000);"
+          then:
+            - lambda: "id(g_saver) = true;"
+            - light.turn_on: { id: display_backlight, brightness: !lambda "return id(g_dim) / 100.0;" }
+            - lvgl.page.show: { id: page_home, animation: FADE_IN, time: 300ms }
+            - lvgl.widget.hide: nav_bar
+            - lvgl.widget.update: { id: page_home, bg_image_opa: TRANSP }
+            - lvgl.widget.update: { id: card_power, bg_opa: TRANSP }
+            - lvgl.widget.update: { id: card_temp, bg_opa: TRANSP }
+            - lvgl.widget.update: { id: card_soc, bg_opa: TRANSP }
+            - lvgl.widget.hide: lbl_n_power
+            - lvgl.widget.hide: lbl_n_temp
+            - lvgl.widget.hide: lbl_n_soc
+
+# =============================================================================
+#  ZEIT
+# =============================================================================
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      then:
+        - script.execute: update_clock
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: update_clock
+
+script:
+  - id: update_clock
+    then:
+      - lvgl.label.update:
+          id: lbl_clock
+          text: !lambda 'return id(ha_time).now().is_valid() ? id(ha_time).now().strftime("%H:%M") : std::string("--:--");'
+      - lvgl.label.update:
+          id: lbl_date
+          text: !lambda |-
+            auto t = id(ha_time).now();
+            if (!t.is_valid()) return std::string("");
+            static const char* wd[] = {"So","Mo","Di","Mi","Do","Fr","Sa"};
+            char b[24];
+            snprintf(b, sizeof(b), "%s, %02d.%02d.%04d", wd[t.day_of_week-1], t.day_of_month, t.month, t.year);
+            return std::string(b);
+  - id: redraw_chart
+    then:
+      - lambda: |-
+          float t[8];
+          for (int i=0;i<8;i++) t[i]=id(g_thist)[i];
+          float mn=1e9f, mx=-1e9f;
+          for (int i=0;i<8;i++){ if(t[i]<mn)mn=t[i]; if(t[i]>mx)mx=t[i]; }
+          if (mx-mn < 2.0f){ float m=(mn+mx)*0.5f; mn=m-1.0f; mx=m+1.0f; }
+          const int xs[8] = {20,76,132,188,244,300,356,412};
+          int yy[8];
+          for (int i=0;i<8;i++) yy[i] = 112 - (int)((t[i]-mn)/(mx-mn)*68.0f);
+          auto col = [](float v)->lv_color_t {
+            float f=(v-2.0f)/20.0f; if(f<0)f=0; if(f>1)f=1;
+            uint8_t r=(uint8_t)(246+f*(56-246));
+            uint8_t g=(uint8_t)(196+f*(211-196));
+            uint8_t b=(uint8_t)(69+f*(159-69));
+            return lv_color_make(r,g,b);
+          };
+          static lv_point_precise_t sp[7][2];
+          sp[0][0].x=xs[0]; sp[0][0].y=yy[0]; sp[0][1].x=xs[1]; sp[0][1].y=yy[1];
+          lv_line_set_points(id(seg0)->obj, sp[0], 2);
+          lv_obj_set_style_line_color(id(seg0)->obj, col((t[0]+t[1])*0.5f), LV_PART_MAIN);
+          sp[1][0].x=xs[1]; sp[1][0].y=yy[1]; sp[1][1].x=xs[2]; sp[1][1].y=yy[2];
+          lv_line_set_points(id(seg1)->obj, sp[1], 2);
+          lv_obj_set_style_line_color(id(seg1)->obj, col((t[1]+t[2])*0.5f), LV_PART_MAIN);
+          sp[2][0].x=xs[2]; sp[2][0].y=yy[2]; sp[2][1].x=xs[3]; sp[2][1].y=yy[3];
+          lv_line_set_points(id(seg2)->obj, sp[2], 2);
+          lv_obj_set_style_line_color(id(seg2)->obj, col((t[2]+t[3])*0.5f), LV_PART_MAIN);
+          sp[3][0].x=xs[3]; sp[3][0].y=yy[3]; sp[3][1].x=xs[4]; sp[3][1].y=yy[4];
+          lv_line_set_points(id(seg3)->obj, sp[3], 2);
+          lv_obj_set_style_line_color(id(seg3)->obj, col((t[3]+t[4])*0.5f), LV_PART_MAIN);
+          sp[4][0].x=xs[4]; sp[4][0].y=yy[4]; sp[4][1].x=xs[5]; sp[4][1].y=yy[5];
+          lv_line_set_points(id(seg4)->obj, sp[4], 2);
+          lv_obj_set_style_line_color(id(seg4)->obj, col((t[4]+t[5])*0.5f), LV_PART_MAIN);
+          sp[5][0].x=xs[5]; sp[5][0].y=yy[5]; sp[5][1].x=xs[6]; sp[5][1].y=yy[6];
+          lv_line_set_points(id(seg5)->obj, sp[5], 2);
+          lv_obj_set_style_line_color(id(seg5)->obj, col((t[5]+t[6])*0.5f), LV_PART_MAIN);
+          sp[6][0].x=xs[6]; sp[6][0].y=yy[6]; sp[6][1].x=xs[7]; sp[6][1].y=yy[7];
+          lv_line_set_points(id(seg6)->obj, sp[6], 2);
+          lv_obj_set_style_line_color(id(seg6)->obj, col((t[6]+t[7])*0.5f), LV_PART_MAIN);
+          lv_obj_set_pos(id(dot0), xs[0]-6, yy[0]-6);
+          lv_obj_set_style_bg_color(id(dot0), col(t[0]), LV_PART_MAIN);
+          lv_obj_set_pos(id(dot1), xs[1]-6, yy[1]-6);
+          lv_obj_set_style_bg_color(id(dot1), col(t[1]), LV_PART_MAIN);
+          lv_obj_set_pos(id(dot2), xs[2]-6, yy[2]-6);
+          lv_obj_set_style_bg_color(id(dot2), col(t[2]), LV_PART_MAIN);
+          lv_obj_set_pos(id(dot3), xs[3]-6, yy[3]-6);
+          lv_obj_set_style_bg_color(id(dot3), col(t[3]), LV_PART_MAIN);
+          lv_obj_set_pos(id(dot4), xs[4]-6, yy[4]-6);
+          lv_obj_set_style_bg_color(id(dot4), col(t[4]), LV_PART_MAIN);
+          lv_obj_set_pos(id(dot5), xs[5]-6, yy[5]-6);
+          lv_obj_set_style_bg_color(id(dot5), col(t[5]), LV_PART_MAIN);
+          lv_obj_set_pos(id(dot6), xs[6]-6, yy[6]-6);
+          lv_obj_set_style_bg_color(id(dot6), col(t[6]), LV_PART_MAIN);
+          lv_obj_set_pos(id(dot7), xs[7]-6, yy[7]-6);
+          lv_obj_set_style_bg_color(id(dot7), col(t[7]), LV_PART_MAIN);
+      - lvgl.label.update:
+          id: gv0
+          text: !lambda |-
+            float v = id(g_thist)[0];
+            char b[12]; snprintf(b, sizeof(b), "%.1f", v);
+            std::string r(b); for (auto &c : r) if (c=='.') c=',';  r += "\u00B0";
+            return r;
+      - lvgl.label.update:
+          id: gv1
+          text: !lambda |-
+            float v = id(g_thist)[1];
+            char b[12]; snprintf(b, sizeof(b), "%.1f", v);
+            std::string r(b); for (auto &c : r) if (c=='.') c=',';  r += "\u00B0";
+            return r;
+      - lvgl.label.update:
+          id: gv2
+          text: !lambda |-
+            float v = id(g_thist)[2];
+            char b[12]; snprintf(b, sizeof(b), "%.1f", v);
+            std::string r(b); for (auto &c : r) if (c=='.') c=',';  r += "\u00B0";
+            return r;
+      - lvgl.label.update:
+          id: gv3
+          text: !lambda |-
+            float v = id(g_thist)[3];
+            char b[12]; snprintf(b, sizeof(b), "%.1f", v);
+            std::string r(b); for (auto &c : r) if (c=='.') c=',';  r += "\u00B0";
+            return r;
+      - lvgl.label.update:
+          id: gv4
+          text: !lambda |-
+            float v = id(g_thist)[4];
+            char b[12]; snprintf(b, sizeof(b), "%.1f", v);
+            std::string r(b); for (auto &c : r) if (c=='.') c=',';  r += "\u00B0";
+            return r;
+      - lvgl.label.update:
+          id: gv5
+          text: !lambda |-
+            float v = id(g_thist)[5];
+            char b[12]; snprintf(b, sizeof(b), "%.1f", v);
+            std::string r(b); for (auto &c : r) if (c=='.') c=',';  r += "\u00B0";
+            return r;
+      - lvgl.label.update:
+          id: gv6
+          text: !lambda |-
+            float v = id(g_thist)[6];
+            char b[12]; snprintf(b, sizeof(b), "%.1f", v);
+            std::string r(b); for (auto &c : r) if (c=='.') c=',';  r += "\u00B0";
+            return r;
+      - lvgl.label.update:
+          id: gv7
+          text: !lambda |-
+            float v = id(g_thist)[7];
+            char b[12]; snprintf(b, sizeof(b), "%.1f", v);
+            std::string r(b); for (auto &c : r) if (c=='.') c=',';  r += "\u00B0";
+            return r;
+
+# =============================================================================
+#  HA-EINSTELLBARE REGLER  (erscheinen in Home Assistant als Number-Entities)
+#  Boot-sicher: on_value setzt NUR die Globals, KEINE LVGL-Aktionen.
+# =============================================================================
+number:
+  - platform: template
+    name: "Standby-Dimmung"
+    id: num_dim
+    icon: "mdi:brightness-6"
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 20
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    mode: slider
+    on_value:
+      - lambda: "id(g_dim) = (int) x;"
+  - platform: template
+    name: "Screensaver-Timeout"
+    id: num_timeout
+    icon: "mdi:timer-outline"
+    min_value: 10
+    max_value: 300
+    step: 5
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "s"
+    mode: box
+    on_value:
+      - lambda: "id(g_timeout) = (int) x;"
+
+# =============================================================================
+#  BENACHRICHTIGUNG  (aus HA befüllbar, erscheint als Popup auf dem Display)
+#  Boot-sicher: on_value ruft LVGL nur auf, wenn das Display bereit ist.
+# =============================================================================
+text:
+  - platform: template
+    name: "Display Nachricht"
+    id: notify_text
+    icon: "mdi:message-text"
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 200
+    on_value:
+      - if:
+          condition:
+            lambda: "return id(g_lvgl_ready);"
+          then:
+            - if:
+                condition:
+                  lambda: "return !x.empty();"
+                then:
+                  - lvgl.label.update: { id: popup_text, text: !lambda "return x;" }
+                  - lvgl.widget.show: popup
+                else:
+                  - lvgl.widget.hide: popup
+
+# =============================================================================
+#  HOME-ASSISTANT-DATEN  ->  Labels aktualisieren
+#  (entity_id jeweils auf deine echten Entitäten anpassen)
+# =============================================================================
+sensor:
+  # Hausstromverbrauch (W) – Startseite
+  - platform: homeassistant
+    id: house_power
+    entity_id: sensor.total_power          # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: lbl_home_power
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.0f W", x); return std::string(b);
+      - lvgl.label.update:
+          id: ic_power
+          text_color: !lambda |-
+            if (isnan(x)) return lv_color_hex(0x5B8DEF);
+            if (x < 300) return lv_color_hex(0x38D39F);
+            if (x < 500) return lv_color_hex(0xF6C445);
+            if (x < 800) return lv_color_hex(0xFF8A3D);
+            return lv_color_hex(0xFF5A5A);
+
+  # Außentemperatur (°C) – Startseite + Wetterseite
+  - platform: homeassistant
+    id: outside_temp
+    entity_id: sensor.aussentemperatur_temperatur                # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: lbl_home_temp
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.1f°", x); return std::string(b);
+      - lvgl.label.update:
+          id: ic_temp
+          text_color: !lambda |-
+            if (isnan(x)) return lv_color_hex(0x35D0E8);
+            if (x < 10) return lv_color_hex(0x5B8DEF);
+            if (x < 16) return lv_color_hex(0x38D39F);
+            if (x < 21) return lv_color_hex(0xF6C445);
+            if (x < 25) return lv_color_hex(0xFF8A3D);
+            return lv_color_hex(0xFF5A5A);
+      - lvgl.label.update:
+          id: lbl_weather_temp
+          text: !lambda |-
+            if (isnan(x)) return std::string("--°");
+            char b[16]; snprintf(b, sizeof(b), "%.1f°", x); return std::string(b);
+      - lambda: |-
+          if (isnan(x)) return;
+          if (id(g_tcount) == 0) { for (int i=0;i<8;i++) id(g_thist)[i] = x; id(g_tcount) = 8; }
+          id(g_thist)[7] = x;
+      - script.execute: redraw_chart
+
+  # Batterie-SoC (%) – Startseite
+  - platform: homeassistant
+    id: battery_soc
+    entity_id: sensor.victron_battery_soc_3                    # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: lbl_home_soc
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.0f %%", x); return std::string(b);
+      - lvgl.label.update:
+          id: ic_soc
+          text_color: !lambda |-
+            if (isnan(x)) return lv_color_hex(0x38D39F);
+            if (x < 15) return lv_color_hex(0xFF5A5A);
+            if (x < 30) return lv_color_hex(0xFF8A3D);
+            if (x < 50) return lv_color_hex(0xF6C445);
+            return lv_color_hex(0x38D39F);
+      - lvgl.label.update:
+          id: ic_soc
+          text: !lambda |-
+            if (isnan(x)) return std::string("\U000F0079");
+            int lvl = (int)((x + 5) / 10) * 10;
+            if (lvl > 100) lvl = 100;
+            if (lvl < 0) lvl = 0;
+            switch (lvl) {
+              case 0:   return std::string("\U000F008E");
+              case 10:  return std::string("\U000F007A");
+              case 20:  return std::string("\U000F007B");
+              case 30:  return std::string("\U000F007C");
+              case 40:  return std::string("\U000F007D");
+              case 50:  return std::string("\U000F007E");
+              case 60:  return std::string("\U000F007F");
+              case 70:  return std::string("\U000F0080");
+              case 80:  return std::string("\U000F0081");
+              case 90:  return std::string("\U000F0082");
+              default:  return std::string("\U000F0079");
+            }
+
+  # Luftfeuchte (%) – Wetterseite
+  - platform: homeassistant
+    id: out_humidity
+    entity_id: sensor.aussentemperatur_luftfeuchtigkeit              # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: lbl_weather_hum
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.0f %%", x); return std::string(b);
+
+  # Wind (km/h) – Wetterseite
+  - platform: homeassistant
+    id: out_wind
+    entity_id: sensor.dein_ort_windgeschwindigkeit            # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: lbl_weather_wind
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.0f km/h", x); return std::string(b);
+
+  # Solarertrag heute (kWh) – Energieseite
+  - platform: homeassistant
+    id: solar_today
+    entity_id: sensor.erzeugung_taglich_kombi_pvanlagennach_ohne_abzug_einspeisung              # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: lbl_e_solar
+          text: !lambda |-
+            if (isnan(x)) return std::string("-- kWh");
+            char b[16]; snprintf(b, sizeof(b), "%.1f kWh", x); return std::string(b);
+
+  # Batterie geladen heute (kWh) – Energieseite
+  - platform: homeassistant
+    id: batt_charged_today
+    entity_id: sensor.batterieladung_vr_kwh_taglich_2          # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: lbl_e_batt
+          text: !lambda |-
+            if (isnan(x)) return std::string("-- kWh");
+            char b[16]; snprintf(b, sizeof(b), "%.1f kWh", x); return std::string(b);
+
+  # Hausverbrauch heute (kWh) – Energieseite
+  - platform: homeassistant
+    id: house_today
+    entity_id: sensor.verbrauch_taglich_nach_abzug             # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: lbl_e_house
+          text: !lambda |-
+            if (isnan(x)) return std::string("-- kWh");
+            char b[16]; snprintf(b, sizeof(b), "%.1f kWh", x); return std::string(b);
+
+  # Netzbezug heute (kWh) – Energieseite
+  - platform: homeassistant
+    id: grid_today
+    entity_id: sensor.stromverbrauch_taglich                 # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: lbl_e_grid
+          text: !lambda |-
+            if (isnan(x)) return std::string("-- kWh");
+            char b[16]; snprintf(b, sizeof(b), "%.1f kWh", x); return std::string(b);
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    update_interval: 30s
+    on_value:
+      - lvgl.label.update:
+          id: lbl_sys_rssi
+          text: !lambda |-
+            int r = (int) x;
+            const char* q = r >= -60 ? "Gut" : (r >= -72 ? "Mittel" : "Schwach");
+            char b[48]; snprintf(b, sizeof(b), "Signal: %d dBm (%s)", r, q); return std::string(b);
+
+  - platform: homeassistant
+    id: heat_target
+    entity_id: climate.wandthermostat
+    attribute: temperature
+    on_value:
+      - lambda: "id(g_settemp) = x;"
+      - lvgl.arc.update: { id: heat_arc, value: !lambda "return (int)(x * 2);" }
+      - lvgl.label.update:
+          id: lbl_heat_val
+          text: !lambda |-
+            char b[12]; snprintf(b, sizeof(b), "%.1f°", x); return std::string(b);
+  - platform: homeassistant
+    id: heat_current
+    entity_id: sensor.wandthermostat_temperatur
+    on_value:
+      - lvgl.label.update:
+          id: lbl_heat_cur
+          text: !lambda |-
+            char b[16]; snprintf(b, sizeof(b), "Ist %.1f°", x); return std::string(b);
+
+text_sensor:
+  # Wetterzustand (weather.*) -> Icon + Text auf der Wetterseite
+  - platform: homeassistant
+    id: weather_state
+    entity_id: weather.dein_ort                          # <-- ENTITY
+    on_value:
+      - lvgl.label.update:
+          id: ic_weather
+          text: !lambda |-
+            std::string s = x;
+            if (s == "sunny")                         return std::string("\U000F0599");
+            if (s == "clear-night")                   return std::string("\U000F0594");
+            if (s == "partlycloudy")                  return std::string("\U000F0595");
+            if (s == "cloudy")                        return std::string("\U000F0590");
+            if (s == "fog")                           return std::string("\U000F0591");
+            if (s == "rainy")                         return std::string("\U000F0597");
+            if (s == "pouring")                       return std::string("\U000F0596");
+            if (s == "snowy" || s == "snowy-rainy")   return std::string("\U000F0598");
+            if (s == "lightning" || s == "lightning-rainy") return std::string("\U000F0593");
+            if (s == "windy" || s == "windy-variant") return std::string("\U000F059D");
+            return std::string("\U000F0590");
+      - lvgl.label.update:
+          id: lbl_weather_text
+          text: !lambda |-
+            std::string s = x;
+            if (s == "sunny")                         return std::string("Sonnig");
+            if (s == "clear-night")                   return std::string("Klar");
+            if (s == "partlycloudy")                  return std::string("Wolkig");
+            if (s == "cloudy")                        return std::string("Wolkig");
+            if (s == "fog")                           return std::string("Neblig");
+            if (s == "rainy")                         return std::string("Regen");
+            if (s == "pouring")                       return std::string("Starkregen");
+            if (s == "snowy")                         return std::string("Schnee");
+            if (s == "lightning" || s == "lightning-rainy") return std::string("Gewitter");
+            if (s == "windy" || s == "windy-variant") return std::string("Windig");
+            return s;
+
+# =============================================================================
+#  LICHTZUSTÄNDE aus HA  ->  Button-Optik (an/aus) spiegeln
+#  Ein binary_sensor je Lampe. entity_id auf deine 8 Lichter anpassen.
+# =============================================================================
+  - platform: wifi_info
+    ssid:
+      id: ti_ssid
+      name: "SSID"
+      on_value:
+        - lvgl.label.update:
+            id: lbl_sys_ssid
+            text: !lambda 'return std::string("WLAN: ") + x;'
+
+  - platform: homeassistant
+    id: heat_mode
+    entity_id: climate.wandthermostat
+    on_value:
+      - if:
+          condition: { lambda: 'return x == "auto";' }
+          then:
+            - lvgl.widget.update: { id: btn_mode_auto, bg_color: "${c_green}" }
+          else:
+            - lvgl.widget.update: { id: btn_mode_auto, bg_color: "${c_card}" }
+      - if:
+          condition: { lambda: 'return x == "off";' }
+          then:
+            - lvgl.widget.update: { id: btn_mode_off, bg_color: "0x33415A" }
+          else:
+            - lvgl.widget.update: { id: btn_mode_off, bg_color: "${c_card}" }
+  - platform: homeassistant
+    id: heat_preset
+    entity_id: climate.wandthermostat
+    attribute: preset_mode
+    on_value:
+      - if:
+          condition: { lambda: 'return x == "boost";' }
+          then:
+            - lvgl.widget.update: { id: btn_mode_boost, bg_color: "0xC2571E" }
+          else:
+            - lvgl.widget.update: { id: btn_mode_boost, bg_color: "${c_card}" }
+# =============================================================================
+# Licht
+# =============================================================================
+binary_sensor:
+  - platform: homeassistant
+    id: st_l1
+    entity_id: light.pc_led_pv_led                          # <-- ENTITY
+    on_state:
+      then:
+        - if:
+            condition: { lambda: 'return x;' }
+            then:
+              - lvgl.widget.update: { id: btn_l1, bg_color: "${c_card_on}" }
+              - lvgl.label.update:  { id: ic_l1,  text_color: "${c_amber}" }
+            else:
+              - lvgl.widget.update: { id: btn_l1, bg_color: "${c_card}" }
+              - lvgl.label.update:  { id: ic_l1,  text_color: "0x59637A" }
+  - platform: homeassistant
+    id: st_l2
+    entity_id: light.wandlicht_h619a                          # <-- ENTITY
+    on_state:
+      then:
+        - if:
+            condition: { lambda: 'return x;' }
+            then:
+              - lvgl.widget.update: { id: btn_l2, bg_color: "${c_card_on}" }
+              - lvgl.label.update:  { id: ic_l2,  text_color: "${c_amber}" }
+            else:
+              - lvgl.widget.update: { id: btn_l2, bg_color: "${c_card}" }
+              - lvgl.label.update:  { id: ic_l2,  text_color: "0x59637A" }
+  - platform: homeassistant
+    id: st_l3
+    entity_id: light.kuchenlicht                          # <-- ENTITY
+    on_state:
+      then:
+        - if:
+            condition: { lambda: 'return x;' }
+            then:
+              - lvgl.widget.update: { id: btn_l3, bg_color: "${c_card_on}" }
+              - lvgl.label.update:  { id: ic_l3,  text_color: "${c_amber}" }
+            else:
+              - lvgl.widget.update: { id: btn_l3, bg_color: "${c_card}" }
+              - lvgl.label.update:  { id: ic_l3,  text_color: "0x59637A" }
+  - platform: homeassistant
+    id: st_l4
+    entity_id: light.kuchenlicht_2                          # <-- ENTITY
+    on_state:
+      then:
+        - if:
+            condition: { lambda: 'return x;' }
+            then:
+              - lvgl.widget.update: { id: btn_l4, bg_color: "${c_card_on}" }
+              - lvgl.label.update:  { id: ic_l4,  text_color: "${c_amber}" }
+            else:
+              - lvgl.widget.update: { id: btn_l4, bg_color: "${c_card}" }
+              - lvgl.label.update:  { id: ic_l4,  text_color: "0x59637A" }
+  - platform: homeassistant
+    id: st_l5
+    entity_id: light.couchlicht                          # <-- ENTITY
+    on_state:
+      then:
+        - if:
+            condition: { lambda: 'return x;' }
+            then:
+              - lvgl.widget.update: { id: btn_l5, bg_color: "${c_card_on}" }
+              - lvgl.label.update:  { id: ic_l5,  text_color: "${c_amber}" }
+            else:
+              - lvgl.widget.update: { id: btn_l5, bg_color: "${c_card}" }
+              - lvgl.label.update:  { id: ic_l5,  text_color: "0x59637A" }
+  - platform: homeassistant
+    id: st_l6
+    entity_id: light.flurlicht                          # <-- ENTITY
+    on_state:
+      then:
+        - if:
+            condition: { lambda: 'return x;' }
+            then:
+              - lvgl.widget.update: { id: btn_l6, bg_color: "${c_card_on}" }
+              - lvgl.label.update:  { id: ic_l6,  text_color: "${c_amber}" }
+            else:
+              - lvgl.widget.update: { id: btn_l6, bg_color: "${c_card}" }
+              - lvgl.label.update:  { id: ic_l6,  text_color: "0x59637A" }
+  - platform: homeassistant
+    id: st_l7
+    entity_id: light.bad_spiegellicht                          # <-- ENTITY
+    on_state:
+      then:
+        - if:
+            condition: { lambda: 'return x;' }
+            then:
+              - lvgl.widget.update: { id: btn_l7, bg_color: "${c_card_on}" }
+              - lvgl.label.update:  { id: ic_l7,  text_color: "${c_amber}" }
+            else:
+              - lvgl.widget.update: { id: btn_l7, bg_color: "${c_card}" }
+              - lvgl.label.update:  { id: ic_l7,  text_color: "0x59637A" }
+  - platform: homeassistant
+    id: st_l8
+    entity_id: light.sockelleisten_steckdose_1                          # <-- ENTITY
+    on_state:
+      then:
+        - if:
+            condition: { lambda: 'return x;' }
+            then:
+              - lvgl.widget.update: { id: btn_l8, bg_color: "${c_card_on}" }
+              - lvgl.label.update:  { id: ic_l8,  text_color: "${c_amber}" }
+            else:
+              - lvgl.widget.update: { id: btn_l8, bg_color: "${c_card}" }
+              - lvgl.label.update:  { id: ic_l8,  text_color: "0x59637A" }
+
+# =============================================================================
+#  HARDWARE  (aus der offiziellen Guition-Board-Definition – nicht ändern)
+# =============================================================================
+button:
+  - platform: restart
+    id: btn_restart_dev
+    name: "Display Neustart"
+
+output:
+  - platform: ledc
+    id: backlight_output
+    frequency: 150Hz
+    min_power: 0.01
+    pin: 38
+    zero_means_zero: true
+
+light:
+  - platform: monochromatic
+    name: Backlight
+    id: display_backlight
+    default_transition_length: 1s
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+spi:
+  - id: lcd_spi
+    clk_pin: 48
+    mosi_pin: 47
+
+i2c:
+  - id: touchscreen_bus
+    scl:
+      ignore_strapping_warning: true
+      number: 45
+    sda: 19
+
+display:
+  - platform: st7701s
+    id: tft_display
+    auto_clear_enabled: false
+    color_order: RGB
+    cs_pin: 39
+    data_pins:
+      blue:  [4, 5, 6, 7, 15]
+      green: [8, 20, 3, 46, 9, 10]
+      red:   [11, 12, 13, 14, 0]
+    data_rate: 2MHz
+    de_pin: 18
+    dimensions:
+      height: 480
+      width: 480
+    hsync_back_porch: 20
+    hsync_front_porch: 10
+    hsync_pin: 16
+    hsync_pulse_width: 8
+    init_sequence: [1, [255, 119, 1, 0, 0, 16], [205, 0]]
+    invert_colors: false
+    pclk_frequency: 12MHz
+    pclk_inverted: false
+    pclk_pin: 21
+    spi_mode: MODE3
+    update_interval: never
+    vsync_back_porch: 10
+    vsync_front_porch: 10
+    vsync_pin: 17
+    vsync_pulse_width: 8
+
+touchscreen:
+  - platform: gt911
+    id: tft_touch
+    display: tft_display
+    on_touch:
+      - lambda: "id(g_lastact) = millis(); id(g_saver) = false;"
+      - light.turn_on:
+          id: display_backlight
+          brightness: !lambda "return id(g_bright) / 100.0;"
+      - lvgl.widget.update: { id: page_home, bg_image_opa: COVER }
+      - lvgl.widget.update: { id: card_power, bg_opa: COVER }
+      - lvgl.widget.update: { id: card_temp, bg_opa: COVER }
+      - lvgl.widget.update: { id: card_soc, bg_opa: COVER }
+      - lvgl.widget.show: lbl_n_power
+      - lvgl.widget.show: lbl_n_temp
+      - lvgl.widget.show: lbl_n_soc
+    # Falls Touch verschoben/gespiegelt ist, hier kalibrieren:
+    # transform:
+    #   swap_xy: false
+    #   mirror_x: false
+    #   mirror_y: false
+
+# Relais (teilen sich laut Doku IO1/IO2/IO40 mit dem I2S-Audio)
+switch:
+  - platform: gpio
+    name: Relay 1
+    id: switch_gpio_1
+    pin: { number: 40, inverted: true }
+  - platform: gpio
+    name: Relay 2
+    id: switch_gpio_2
+    pin: { number: 2, inverted: true }
+  - platform: gpio
+    name: Relay 3
+    id: switch_gpio_3
+    pin: { number: 1, inverted: true }
+
+# =============================================================================
+#  FONTS
+#  Montserrat (Text, via Google Fonts) + Material Design Icons (via URL).
+#  Beim Build werden die Dateien einmalig heruntergeladen (HA hat Internet).
+# =============================================================================
+font:
+  - file: { type: gfonts, family: Montserrat, weight: 700 }
+    id: font_clock
+    size: 92
+    bpp: 4
+    glyphs: ["0","1","2","3","4","5","6","7","8","9",":","-"]
+  - file: { type: gfonts, family: Montserrat, weight: 600 }
+    id: font_xxl
+    size: 46
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+  - file: { type: gfonts, family: Montserrat, weight: 600 }
+    id: font_l
+    size: 30
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+  - file: { type: gfonts, family: Montserrat, weight: 500 }
+    id: font_m
+    size: 22
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+  - file: { type: gfonts, family: Montserrat, weight: 600 }
+    id: font_s
+    size: 17
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+  - file: { type: gfonts, family: Montserrat, weight: 500 }
+    id: font_xs
+    size: 14
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+  # ---- Material Design Icons -------------------------------------------------
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icon_l
+    size: 40
+    bpp: 4
+    glyphs: &mdi_glyphs
+      - "\U000F02DC"   # home
+      - "\U000F0335"   # lightbulb
+      - "\U000F0241"   # flash (Leistung)
+      - "\U000F050F"   # thermometer
+      - "\U000F0079"   # battery (100)
+      - "\U000F007A"   # battery-10
+      - "\U000F007B"   # battery-20
+      - "\U000F007C"   # battery-30
+      - "\U000F007D"   # battery-40
+      - "\U000F007E"   # battery-50
+      - "\U000F007F"   # battery-60
+      - "\U000F0080"   # battery-70
+      - "\U000F0081"   # battery-80
+      - "\U000F0082"   # battery-90
+      - "\U000F008E"   # battery-outline (0)
+      - "\U000F0233"   # battery-charging
+      - "\U000F0595"   # weather-partly-cloudy
+      - "\U000F0599"   # weather-sunny
+      - "\U000F0594"   # weather-night
+      - "\U000F0590"   # weather-cloudy
+      - "\U000F0591"   # weather-fog
+      - "\U000F0597"   # weather-rainy
+      - "\U000F0596"   # weather-pouring
+      - "\U000F0598"   # weather-snowy
+      - "\U000F0593"   # weather-lightning
+      - "\U000F059D"   # weather-windy
+      - "\U000F058E"   # water-percent (Luftfeuchte)
+      - "\U000F0D47"   # solar-power
+      - "\U000F0D8A"   # transmission-tower (Netz)
+      - "\U000F0128"   # chart-bar (Energie)
+      - "\U000F00E0"   # brightness-7 (PC LED)
+      - "\U000F1020"   # coach-lamp (Wandlicht)
+      - "\U000F0769"   # ceiling-light (Kueche)
+      - "\U000F18DD"   # ceiling-light-multiple (Kueche Decke)
+      - "\U000F1302"   # sofa (Couch)
+      - "\U000F1793"   # chandelier (Flur)
+      - "\U000F17C7"   # ceiling-light-outline (Bad Spiegel)
+      - "\U000F00DE"   # brightness-5 (Sockelleiste)
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icon_nav
+    size: 30
+    bpp: 4
+    glyphs: *mdi_glyphs
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icon_xl
+    size: 96
+    bpp: 4
+    glyphs: *mdi_glyphs
+
+# =============================================================================
+#  LVGL – Oberfläche
+# =============================================================================
+image:
+  - file: hintergrund.png          # muss im ESPHome-Ordner liegen (/config/esphome/)
+    id: bg_img
+    type: RGB565
+
+lvgl:
+  displays:
+    - tft_display
+  touchscreens:
+    - tft_touch
+  buffer_size: 25%
+  default_font: font_m
+  bg_color: "${c_bg}"
+
+  # graue Scrollbar-Linien global unterdruecken
+  theme:
+    obj:
+      scrollbar_mode: "off"
+
+  # Screensaver wird ueber die interval-Sektion + g_timeout gesteuert (einstellbar)
+
+  style_definitions:
+    - id: card
+      bg_color: "${c_card}"
+      bg_opa: COVER
+      radius: 20
+      border_width: 0
+      shadow_width: 0
+      pad_all: 12
+
+  # Bottom-Menü (liegt als top_layer über allen Seiten, auf Home versteckt)
+  top_layer:
+    widgets:
+      - obj:
+          id: nav_bar
+          align: BOTTOM_MID
+          x: 0
+          y: 0
+          width: 100%
+          height: 74
+          bg_color: "0x0F141E"
+          bg_opa: COVER
+          radius: 0
+          border_width: 0
+          pad_all: 0
+          hidden: true
+          layout:
+            type: flex
+            flex_flow: ROW
+            flex_align_main: SPACE_EVENLY
+            flex_align_cross: CENTER
+          widgets:
+            - button:
+                width: 84
+                height: 74
+                bg_opa: TRANSP
+                border_width: 0
+                shadow_width: 0
+                on_click:
+                  - lvgl.page.show: { id: page_home, animation: FADE_IN, time: 200ms }
+                  - lvgl.widget.hide: nav_bar
+                widgets:
+                  - label: { text: "\U000F02DC", text_font: font_icon_nav, text_color: "${c_cyan}", align: CENTER }
+            - button:
+                width: 84
+                height: 74
+                bg_opa: TRANSP
+                border_width: 0
+                shadow_width: 0
+                on_click:
+                  - lvgl.page.show: { id: page_lights, animation: FADE_IN, time: 200ms }
+                widgets:
+                  - label: { text: "\U000F0335", text_font: font_icon_nav, text_color: "${c_amber}", align: CENTER }
+            - button:
+                width: 84
+                height: 74
+                bg_opa: TRANSP
+                border_width: 0
+                shadow_width: 0
+                on_click:
+                  - lvgl.page.show: { id: page_weather, animation: FADE_IN, time: 200ms }
+                widgets:
+                  - label: { text: "\U000F0595", text_font: font_icon_nav, text_color: "${c_blue}", align: CENTER }
+            - button:
+                width: 84
+                height: 74
+                bg_opa: TRANSP
+                border_width: 0
+                shadow_width: 0
+                on_click:
+                  - lvgl.page.show: { id: page_energy, animation: FADE_IN, time: 200ms }
+                widgets:
+                  - label: { text: "\U000F0128", text_font: font_icon_nav, text_color: "${c_green}", align: CENTER }
+            - button:
+                width: 84
+                height: 74
+                bg_opa: TRANSP
+                border_width: 0
+                shadow_width: 0
+                on_click:
+                  - lvgl.page.show: { id: page_heat, animation: FADE_IN, time: 200ms }
+                widgets:
+                  - label: { text: "\U000F050F", text_font: font_icon_nav, text_color: "${c_orange}", align: CENTER }
+
+      # ---- Benachrichtigungs-Popup (liegt ueber allem, beim Boot versteckt) -----
+      - obj:
+          id: popup
+          x: 0
+          y: 0
+          width: 100%
+          height: 100%
+          bg_color: "0x000000"
+          bg_opa: 60%
+          radius: 0
+          border_width: 0
+          pad_all: 0
+          hidden: true
+          clickable: true
+          scrollbar_mode: "off"
+          on_click:
+            - lvgl.widget.hide: popup
+          widgets:
+            - obj:
+                id: popup_card
+                styles: card
+                scrollbar_mode: "off"
+                align: CENTER
+                width: 420
+                height: 240
+                clickable: false
+                widgets:
+                  - label: { text: "Info", text_font: font_l, text_color: "${c_cyan}", align: TOP_MID, y: 16 }
+                  - label: { id: popup_text, text: "", text_font: font_m, text_color: "${c_text}", text_align: CENTER, long_mode: WRAP, width: 372, align: CENTER, y: 6 }
+                  - label: { text: "Tippen zum Schließen", text_font: font_xs, text_color: "${c_muted}", align: BOTTOM_MID, y: -14 }
+
+  pages:
+    # ========================================================================
+    #  STARTSEITE / SCREENSAVER  (tippen -> Licht)
+    # ========================================================================
+    - id: page_home
+      bg_color: "0x000000"
+      bg_image_src: bg_img
+      bg_image_opa: COVER
+      widgets:
+        # Vollflaechige Tap-Flaeche (unterste Ebene) -> Licht
+        - obj:
+            id: home_touch
+            x: 0
+            y: 0
+            width: 100%
+            height: 100%
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            on_click:
+              - lvgl.page.show: { id: page_lights, animation: OVER_LEFT, time: 250ms }
+              - lvgl.widget.show: nav_bar
+        - label:
+            id: lbl_date
+            align: TOP_MID
+            y: 40
+            text: ""
+            text_font: font_m
+            text_color: "${c_muted}"
+        - label:
+            id: lbl_clock
+            align: CENTER
+            y: -88
+            text: "--:--"
+            text_font: font_clock
+            text_color: "${c_text}"
+            clickable: true
+            on_short_click:
+              - lvgl.page.show: { id: page_lights, animation: OVER_LEFT, time: 250ms }
+              - lvgl.widget.show: nav_bar
+            on_long_press:
+              - lvgl.page.show: { id: page_system, animation: FADE_IN, time: 250ms }
+              - lvgl.widget.show: nav_bar
+
+        # ---- Statuszeile unten (klickbar): Verbrauch/Batterie->Energie, Temp->Wetter
+        - obj:
+            align: BOTTOM_MID
+            y: -20
+            width: 456
+            height: 168
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            layout:
+              type: flex
+              flex_flow: ROW
+              flex_align_main: SPACE_BETWEEN
+              flex_align_cross: CENTER
+            widgets:
+              - obj:
+                  id: card_power
+                  styles: card
+                  scrollbar_mode: "off"
+                  width: 144
+                  height: 168
+                  clickable: true
+                  on_click:
+                    - lvgl.page.show: { id: page_energy, animation: OVER_LEFT, time: 250ms }
+                    - lvgl.widget.show: nav_bar
+                  widgets:
+                    - label: { id: ic_power, text: "\U000F0241", text_font: font_icon_l, text_color: "${c_blue}", align: CENTER, y: -30 }
+                    - label: { id: lbl_home_power, text: "--", text_font: font_l, text_color: "${c_text}", align: CENTER, y: 8 }
+                    - label: { id: lbl_n_power, text: "Verbrauch", text_font: font_xs, text_color: "${c_muted}", align: CENTER, y: 48 }
+              - obj:
+                  id: card_temp
+                  styles: card
+                  scrollbar_mode: "off"
+                  width: 144
+                  height: 168
+                  clickable: true
+                  on_click:
+                    - lvgl.page.show: { id: page_weather, animation: OVER_LEFT, time: 250ms }
+                    - lvgl.widget.show: nav_bar
+                  widgets:
+                    - label: { id: ic_temp, text: "\U000F050F", text_font: font_icon_l, text_color: "${c_cyan}", align: CENTER, y: -30 }
+                    - label: { id: lbl_home_temp, text: "--", text_font: font_l, text_color: "${c_text}", align: CENTER, y: 8 }
+                    - label: { id: lbl_n_temp, text: "Temperatur", text_font: font_xs, text_color: "${c_muted}", align: CENTER, y: 48 }
+              - obj:
+                  id: card_soc
+                  styles: card
+                  scrollbar_mode: "off"
+                  width: 144
+                  height: 168
+                  clickable: true
+                  on_click:
+                    - lvgl.page.show: { id: page_energy, animation: OVER_LEFT, time: 250ms }
+                    - lvgl.widget.show: nav_bar
+                  widgets:
+                    - label: { id: ic_soc, text: "\U000F0079", text_font: font_icon_l, text_color: "${c_green}", align: CENTER, y: -30 }
+                    - label: { id: lbl_home_soc, text: "--", text_font: font_l, text_color: "${c_text}", align: CENTER, y: 8 }
+                    - label: { id: lbl_n_soc, text: "Batterie", text_font: font_xs, text_color: "${c_muted}", align: CENTER, y: 48 }
+
+    # ========================================================================
+    #  SEITE 1 – LICHT (8 Schalter)
+    # ========================================================================
+    - id: page_lights
+      bg_color: "${c_bg}"
+      bg_image_src: bg_img
+      bg_image_opa: COVER
+      widgets:
+        - label: { text: "Licht", align: TOP_LEFT, x: 20, y: 22, text_font: font_l, text_color: "${c_text}" }
+        - obj:
+            align: TOP_MID
+            y: 64
+            width: 456
+            height: 330
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            layout:
+              type: flex
+              flex_flow: ROW_WRAP
+              flex_align_main: SPACE_BETWEEN
+              flex_align_cross: CENTER
+              flex_align_track: SPACE_BETWEEN
+            widgets:
+              - button:
+                  id: btn_l1
+                  width: 222
+                  height: 72
+                  bg_color: "${c_card}"
+                  bg_opa: COVER
+                  radius: 18
+                  border_width: 0
+                  shadow_width: 0
+                  pad_all: 12
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  on_click:
+                    - homeassistant.action:
+                        action: light.toggle
+                        data: { entity_id: light.pc_led_pv_led }     # <-- ENTITY
+                  widgets:
+                    - label: { id: ic_l1, text: "\U000F00E0", text_font: font_icon_l, text_color: "0x59637A" }
+                    - label: { text: "PC LED", text_font: font_s, text_color: "${c_text}" }
+              - button:
+                  id: btn_l2
+                  width: 222
+                  height: 72
+                  bg_color: "${c_card}"
+                  bg_opa: COVER
+                  radius: 18
+                  border_width: 0
+                  shadow_width: 0
+                  pad_all: 12
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  on_click:
+                    - homeassistant.action:
+                        action: light.toggle
+                        data: { entity_id: light.wandlicht_h619a }     # <-- ENTITY
+                  widgets:
+                    - label: { id: ic_l2, text: "\U000F1020", text_font: font_icon_l, text_color: "0x59637A" }
+                    - label: { text: "Wandlicht", text_font: font_s, text_color: "${c_text}" }
+              - button:
+                  id: btn_l3
+                  width: 222
+                  height: 72
+                  bg_color: "${c_card}"
+                  bg_opa: COVER
+                  radius: 18
+                  border_width: 0
+                  shadow_width: 0
+                  pad_all: 12
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  on_click:
+                    - homeassistant.action:
+                        action: light.toggle
+                        data: { entity_id: light.kuchenlicht }     # <-- ENTITY
+                  widgets:
+                    - label: { id: ic_l3, text: "\U000F0769", text_font: font_icon_l, text_color: "0x59637A" }
+                    - label: { text: "Küche", text_font: font_s, text_color: "${c_text}" }
+              - button:
+                  id: btn_l4
+                  width: 222
+                  height: 72
+                  bg_color: "${c_card}"
+                  bg_opa: COVER
+                  radius: 18
+                  border_width: 0
+                  shadow_width: 0
+                  pad_all: 12
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  on_click:
+                    - homeassistant.action:
+                        action: light.toggle
+                        data: { entity_id: light.kuchenlicht_2 }     # <-- ENTITY
+                  widgets:
+                    - label: { id: ic_l4, text: "\U000F18DD", text_font: font_icon_l, text_color: "0x59637A" }
+                    - label: { text: "Küche Decke", text_font: font_s, text_color: "${c_text}" }
+              - button:
+                  id: btn_l5
+                  width: 222
+                  height: 72
+                  bg_color: "${c_card}"
+                  bg_opa: COVER
+                  radius: 18
+                  border_width: 0
+                  shadow_width: 0
+                  pad_all: 12
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  on_click:
+                    - homeassistant.action:
+                        action: light.toggle
+                        data: { entity_id: light.couchlicht }     # <-- ENTITY
+                  widgets:
+                    - label: { id: ic_l5, text: "\U000F1302", text_font: font_icon_l, text_color: "0x59637A" }
+                    - label: { text: "Couch", text_font: font_s, text_color: "${c_text}" }
+              - button:
+                  id: btn_l6
+                  width: 222
+                  height: 72
+                  bg_color: "${c_card}"
+                  bg_opa: COVER
+                  radius: 18
+                  border_width: 0
+                  shadow_width: 0
+                  pad_all: 12
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  on_click:
+                    - homeassistant.action:
+                        action: light.toggle
+                        data: { entity_id: light.flurlicht }     # <-- ENTITY
+                  widgets:
+                    - label: { id: ic_l6, text: "\U000F1793", text_font: font_icon_l, text_color: "0x59637A" }
+                    - label: { text: "Flur", text_font: font_s, text_color: "${c_text}" }
+              - button:
+                  id: btn_l7
+                  width: 222
+                  height: 72
+                  bg_color: "${c_card}"
+                  bg_opa: COVER
+                  radius: 18
+                  border_width: 0
+                  shadow_width: 0
+                  pad_all: 12
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  on_click:
+                    - homeassistant.action:
+                        action: light.toggle
+                        data: { entity_id: light.bad_spiegellicht }     # <-- ENTITY
+                  widgets:
+                    - label: { id: ic_l7, text: "\U000F17C7", text_font: font_icon_l, text_color: "0x59637A" }
+                    - label: { text: "Bad Spiegel", text_font: font_s, text_color: "${c_text}" }
+              - button:
+                  id: btn_l8
+                  width: 222
+                  height: 72
+                  bg_color: "${c_card}"
+                  bg_opa: COVER
+                  radius: 18
+                  border_width: 0
+                  shadow_width: 0
+                  pad_all: 12
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  on_click:
+                    - homeassistant.action:
+                        action: light.toggle
+                        data: { entity_id: light.sockelleisten_steckdose_1 }     # <-- ENTITY
+                  widgets:
+                    - label: { id: ic_l8, text: "\U000F00DE", text_font: font_icon_l, text_color: "0x59637A" }
+                    - label: { text: "Sockelleiste", text_font: font_s, text_color: "${c_text}" }
+
+    # ========================================================================
+    #  SEITE 2 – WETTER
+    # ========================================================================
+    - id: page_weather
+      bg_color: "${c_bg}"
+      bg_image_src: bg_img
+      bg_image_opa: COVER
+      widgets:
+        - label: { text: "Wetter", align: TOP_LEFT, x: 20, y: 22, text_font: font_l, text_color: "${c_text}" }
+        - label:
+            id: ic_weather
+            align: TOP_LEFT
+            x: 26
+            y: 52
+            text: "\U000F0595"
+            text_font: font_icon_xl
+            text_color: "${c_blue}"
+        - label:
+            id: lbl_weather_temp
+            align: TOP_RIGHT
+            x: -26
+            y: 60
+            text: "--°"
+            text_font: font_xxl
+            text_color: "${c_text}"
+        - label:
+            id: lbl_weather_text
+            align: TOP_RIGHT
+            x: -26
+            y: 118
+            text: "--"
+            text_font: font_m
+            text_color: "${c_muted}"
+        # ---- Verlauf Außentemperatur (12 h) --------------------------------
+        - obj:
+            styles: card
+            scrollbar_mode: "off"
+            align: TOP_MID
+            y: 152
+            width: 448
+            height: 146
+            clickable: false
+            widgets:
+              - line:
+                  id: seg0
+                  align: TOP_LEFT
+                  x: 0
+                  y: 0
+                  line_width: 4
+                  line_rounded: true
+                  line_color: "${c_amber}"
+                  points:
+                    - { x: 0, y: 60 }
+                    - { x: 1, y: 60 }
+              - line:
+                  id: seg1
+                  align: TOP_LEFT
+                  x: 0
+                  y: 0
+                  line_width: 4
+                  line_rounded: true
+                  line_color: "${c_amber}"
+                  points:
+                    - { x: 0, y: 60 }
+                    - { x: 1, y: 60 }
+              - line:
+                  id: seg2
+                  align: TOP_LEFT
+                  x: 0
+                  y: 0
+                  line_width: 4
+                  line_rounded: true
+                  line_color: "${c_amber}"
+                  points:
+                    - { x: 0, y: 60 }
+                    - { x: 1, y: 60 }
+              - line:
+                  id: seg3
+                  align: TOP_LEFT
+                  x: 0
+                  y: 0
+                  line_width: 4
+                  line_rounded: true
+                  line_color: "${c_amber}"
+                  points:
+                    - { x: 0, y: 60 }
+                    - { x: 1, y: 60 }
+              - line:
+                  id: seg4
+                  align: TOP_LEFT
+                  x: 0
+                  y: 0
+                  line_width: 4
+                  line_rounded: true
+                  line_color: "${c_amber}"
+                  points:
+                    - { x: 0, y: 60 }
+                    - { x: 1, y: 60 }
+              - line:
+                  id: seg5
+                  align: TOP_LEFT
+                  x: 0
+                  y: 0
+                  line_width: 4
+                  line_rounded: true
+                  line_color: "${c_amber}"
+                  points:
+                    - { x: 0, y: 60 }
+                    - { x: 1, y: 60 }
+              - line:
+                  id: seg6
+                  align: TOP_LEFT
+                  x: 0
+                  y: 0
+                  line_width: 4
+                  line_rounded: true
+                  line_color: "${c_amber}"
+                  points:
+                    - { x: 0, y: 60 }
+                    - { x: 1, y: 60 }
+              - obj:
+                  id: dot0
+                  width: 12
+                  height: 12
+                  radius: 6
+                  bg_color: "${c_amber}"
+                  bg_opa: COVER
+                  border_width: 0
+                  x: 14
+                  y: 60
+              - obj:
+                  id: dot1
+                  width: 12
+                  height: 12
+                  radius: 6
+                  bg_color: "${c_amber}"
+                  bg_opa: COVER
+                  border_width: 0
+                  x: 70
+                  y: 60
+              - obj:
+                  id: dot2
+                  width: 12
+                  height: 12
+                  radius: 6
+                  bg_color: "${c_amber}"
+                  bg_opa: COVER
+                  border_width: 0
+                  x: 126
+                  y: 60
+              - obj:
+                  id: dot3
+                  width: 12
+                  height: 12
+                  radius: 6
+                  bg_color: "${c_amber}"
+                  bg_opa: COVER
+                  border_width: 0
+                  x: 182
+                  y: 60
+              - obj:
+                  id: dot4
+                  width: 12
+                  height: 12
+                  radius: 6
+                  bg_color: "${c_amber}"
+                  bg_opa: COVER
+                  border_width: 0
+                  x: 238
+                  y: 60
+              - obj:
+                  id: dot5
+                  width: 12
+                  height: 12
+                  radius: 6
+                  bg_color: "${c_amber}"
+                  bg_opa: COVER
+                  border_width: 0
+                  x: 294
+                  y: 60
+              - obj:
+                  id: dot6
+                  width: 12
+                  height: 12
+                  radius: 6
+                  bg_color: "${c_amber}"
+                  bg_opa: COVER
+                  border_width: 0
+                  x: 350
+                  y: 60
+              - obj:
+                  id: dot7
+                  width: 12
+                  height: 12
+                  radius: 6
+                  bg_color: "${c_amber}"
+                  bg_opa: COVER
+                  border_width: 0
+                  x: 406
+                  y: 60
+              - label: { id: gv0, text: "--", text_font: font_xs, text_color: "${c_text}", align: TOP_LEFT, x: 4, y: 0 }
+              - label: { id: gv1, text: "--", text_font: font_xs, text_color: "${c_text}", align: TOP_LEFT, x: 60, y: 0 }
+              - label: { id: gv2, text: "--", text_font: font_xs, text_color: "${c_text}", align: TOP_LEFT, x: 116, y: 0 }
+              - label: { id: gv3, text: "--", text_font: font_xs, text_color: "${c_text}", align: TOP_LEFT, x: 172, y: 0 }
+              - label: { id: gv4, text: "--", text_font: font_xs, text_color: "${c_text}", align: TOP_LEFT, x: 228, y: 0 }
+              - label: { id: gv5, text: "--", text_font: font_xs, text_color: "${c_text}", align: TOP_LEFT, x: 284, y: 0 }
+              - label: { id: gv6, text: "--", text_font: font_xs, text_color: "${c_text}", align: TOP_LEFT, x: 340, y: 0 }
+              - label: { id: gv7, text: "--", text_font: font_xs, text_color: "${c_text}", align: TOP_LEFT, x: 396, y: 0 }
+        # ---- Detailkarten: Luftfeuchte + Wind ------------------------------
+        - obj:
+            align: BOTTOM_MID
+            y: -84
+            width: 456
+            height: 92
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            layout: { type: flex, flex_flow: ROW, flex_align_main: SPACE_BETWEEN, flex_align_cross: CENTER }
+            widgets:
+              - obj:
+                  styles: card
+                  scrollbar_mode: "off"
+                  width: 222
+                  height: 92
+                  clickable: false
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  widgets:
+                    - label: { text: "\U000F058E", text_font: font_icon_l, text_color: "${c_cyan}" }
+                    - obj:
+                        width: 150
+                        height: 66
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        clickable: false
+                        scrollbar_mode: "off"
+                        layout: { type: flex, flex_flow: COLUMN, flex_align_main: CENTER, flex_align_cross: START }
+                        widgets:
+                          - label: { id: lbl_weather_hum, text: "--", text_font: font_l, text_color: "${c_text}" }
+                          - label: { text: "Luftfeuchte", text_font: font_xs, text_color: "${c_muted}" }
+              - obj:
+                  styles: card
+                  scrollbar_mode: "off"
+                  width: 222
+                  height: 92
+                  clickable: false
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  widgets:
+                    - label: { text: "\U000F059D", text_font: font_icon_l, text_color: "${c_green}" }
+                    - obj:
+                        width: 150
+                        height: 66
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        clickable: false
+                        scrollbar_mode: "off"
+                        layout: { type: flex, flex_flow: COLUMN, flex_align_main: CENTER, flex_align_cross: START }
+                        widgets:
+                          - label: { id: lbl_weather_wind, text: "--", text_font: font_l, text_color: "${c_text}" }
+                          - label: { text: "Wind", text_font: font_xs, text_color: "${c_muted}" }
+
+    # ========================================================================
+    #  SEITE 3 – ENERGIE (heute)
+    # ========================================================================
+    - id: page_energy
+      bg_color: "${c_bg}"
+      bg_image_src: bg_img
+      bg_image_opa: COVER
+      widgets:
+        - label: { text: "Energie heute", align: TOP_LEFT, x: 20, y: 22, text_font: font_l, text_color: "${c_text}" }
+        - obj:
+            align: TOP_MID
+            y: 62
+            width: 456
+            height: 330
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            layout: { type: flex, flex_flow: COLUMN, flex_align_main: SPACE_BETWEEN, flex_align_cross: CENTER }
+            widgets:
+              - obj:
+                  styles: card
+                  scrollbar_mode: "off"
+                  width: 456
+                  height: 72
+                  clickable: false
+                  pad_all: 14
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  widgets:
+                    - label: { text: "\U000F0D47", text_font: font_icon_l, text_color: "${c_amber}" }
+                    - label: { text: "Solar", text_font: font_m, text_color: "${c_text}", flex_grow: 1 }
+                    - label: { id: lbl_e_solar, text: "-- kWh", text_font: font_l, text_color: "${c_amber}" }
+              - obj:
+                  styles: card
+                  scrollbar_mode: "off"
+                  width: 456
+                  height: 72
+                  clickable: false
+                  pad_all: 14
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  widgets:
+                    - label: { text: "\U000F0233", text_font: font_icon_l, text_color: "${c_green}" }
+                    - label: { text: "Batterie geladen", text_font: font_m, text_color: "${c_text}", flex_grow: 1 }
+                    - label: { id: lbl_e_batt, text: "-- kWh", text_font: font_l, text_color: "${c_green}" }
+              - obj:
+                  styles: card
+                  scrollbar_mode: "off"
+                  width: 456
+                  height: 72
+                  clickable: false
+                  pad_all: 14
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  widgets:
+                    - label: { text: "\U000F0D8A", text_font: font_icon_l, text_color: "${c_blue}" }
+                    - label: { text: "Netzbezug", text_font: font_m, text_color: "${c_text}", flex_grow: 1 }
+                    - label: { id: lbl_e_grid, text: "-- kWh", text_font: font_l, text_color: "${c_blue}" }
+              - obj:
+                  styles: card
+                  scrollbar_mode: "off"
+                  width: 456
+                  height: 72
+                  clickable: false
+                  pad_all: 14
+                  layout: { type: flex, flex_flow: ROW, flex_align_main: START, flex_align_cross: CENTER }
+                  widgets:
+                    - label: { text: "\U000F0241", text_font: font_icon_l, text_color: "${c_orange}" }
+                    - label: { text: "Hausverbrauch", text_font: font_m, text_color: "${c_text}", flex_grow: 1 }
+                    - label: { id: lbl_e_house, text: "-- kWh", text_font: font_l, text_color: "${c_orange}" }
+
+    # ========================================================================
+    #  SYSTEM (versteckt – Uhrzeit lange antippen)
+    # ========================================================================
+    - id: page_system
+      bg_color: "${c_bg}"
+      bg_image_src: bg_img
+      bg_image_opa: COVER
+      widgets:
+        - label: { text: "System", align: TOP_LEFT, x: 20, y: 22, text_font: font_l, text_color: "${c_text}" }
+        - obj:
+            styles: card
+            scrollbar_mode: "off"
+            align: TOP_MID
+            y: 84
+            width: 448
+            height: 76
+            clickable: false
+            layout: { type: flex, flex_flow: COLUMN, flex_align_main: CENTER, flex_align_cross: START }
+            widgets:
+              - label: { id: lbl_sys_ssid, text: "WLAN: --", text_font: font_m, text_color: "${c_text}" }
+              - label: { id: lbl_sys_rssi, text: "Signal: --", text_font: font_s, text_color: "${c_muted}" }
+        - label: { text: "Helligkeit", align: TOP_LEFT, x: 24, y: 172, text_font: font_s, text_color: "${c_muted}" }
+        - slider:
+            id: sl_bright
+            align: TOP_MID
+            y: 196
+            width: 420
+            height: 14
+            min_value: 5
+            max_value: 100
+            value: 100
+            on_value:
+              - light.turn_on:
+                  id: display_backlight
+                  brightness: !lambda "return x / 100.0;"
+              - lambda: "id(g_bright) = (int) x;"
+        - label: { text: "Standby-Dimmung", align: TOP_LEFT, x: 24, y: 226, text_font: font_s, text_color: "${c_muted}" }
+        - slider:
+            id: sl_dim
+            align: TOP_MID
+            y: 250
+            width: 420
+            height: 14
+            min_value: 0
+            max_value: 100
+            value: 20
+            on_value:
+              - number.set: { id: num_dim, value: !lambda "return x;" }
+        - label: { id: lbl_timeout, text: "Screensaver: 30 s", align: TOP_LEFT, x: 24, y: 280, text_font: font_s, text_color: "${c_muted}" }
+        - slider:
+            id: sl_timeout
+            align: TOP_MID
+            y: 304
+            width: 420
+            height: 14
+            min_value: 10
+            max_value: 300
+            value: 30
+            on_value:
+              - number.set: { id: num_timeout, value: !lambda "return x;" }
+              - lvgl.label.update:
+                  id: lbl_timeout
+                  text: !lambda |-
+                    char b[24]; snprintf(b, sizeof(b), "Screensaver: %d s", (int) x); return std::string(b);
+        - button:
+            id: btn_restart_ui
+            align: TOP_MID
+            y: 336
+            width: 240
+            height: 54
+            bg_color: "0x3A2030"
+            bg_opa: COVER
+            radius: 16
+            shadow_width: 0
+            on_click:
+              - button.press: btn_restart_dev
+            widgets:
+              - label: { text: "Neustart", text_font: font_m, text_color: "0xFF7A7A", align: CENTER }
+
+    # ========================================================================
+    #  HEIZUNG (Wohnzimmer-Thermostat)
+    # ========================================================================
+    - id: page_heat
+      bg_color: "${c_bg}"
+      bg_image_src: bg_img
+      bg_image_opa: COVER
+      widgets:
+        - label: { text: "Heizung", align: TOP_LEFT, x: 20, y: 22, text_font: font_l, text_color: "${c_text}" }
+        - button:
+            id: btn_mode_auto
+            align: TOP_MID
+            x: -146
+            y: 84
+            width: 138
+            height: 42
+            bg_color: "${c_card}"
+            bg_opa: COVER
+            radius: 14
+            shadow_width: 0
+            on_click:
+              - homeassistant.action:
+                  action: climate.set_hvac_mode
+                  data:
+                    entity_id: climate.wandthermostat_jan_2
+                    hvac_mode: "auto"
+            widgets:
+              - label: { text: "Auto", text_font: font_m, text_color: "${c_text}", align: CENTER }
+        - button:
+            id: btn_mode_boost
+            align: TOP_MID
+            x: 0
+            y: 84
+            width: 138
+            height: 42
+            bg_color: "${c_card}"
+            bg_opa: COVER
+            radius: 14
+            shadow_width: 0
+            on_click:
+              - homeassistant.action:
+                  action: climate.set_preset_mode
+                  data:
+                    entity_id: climate.wandthermostat_jan_2
+                    preset_mode: "boost"
+            widgets:
+              - label: { text: "Boost", text_font: font_m, text_color: "${c_text}", align: CENTER }
+        - button:
+            id: btn_mode_off
+            align: TOP_MID
+            x: 146
+            y: 84
+            width: 138
+            height: 42
+            bg_color: "${c_card}"
+            bg_opa: COVER
+            radius: 14
+            shadow_width: 0
+            on_click:
+              - homeassistant.action:
+                  action: climate.set_hvac_mode
+                  data:
+                    entity_id: climate.wandthermostat_jan_2
+                    hvac_mode: "off"
+            widgets:
+              - label: { text: "Off", text_font: font_m, text_color: "${c_text}", align: CENTER }
+        - arc:
+            id: heat_arc
+            align: TOP_MID
+            y: 138
+            width: 224
+            height: 224
+            adjustable: true
+            min_value: 10
+            max_value: 52
+            value: 42
+            arc_color: "0x2A3446"
+            arc_width: 18
+            indicator:
+              arc_color: "${c_orange}"
+              arc_width: 18
+            knob:
+              bg_color: "${c_orange}"
+            on_value:
+              - lambda: "id(g_settemp) = x / 2.0;"
+              - lvgl.label.update:
+                  id: lbl_heat_val
+                  text: !lambda |-
+                    char b[12]; snprintf(b, sizeof(b), "%.1f°", x / 2.0); return std::string(b);
+            on_release:
+              - homeassistant.action:
+                  action: climate.set_temperature
+                  data:
+                    entity_id: climate.wandthermostat_jan_2
+                  variables:
+                    temp: !lambda "return id(g_settemp);"
+                  data_template:
+                    temperature: "{{ temp }}"
+            widgets:
+              - label: { id: lbl_heat_val, text: "--°", text_font: font_xxl, text_color: "${c_text}", align: CENTER, y: -8 }
+              - label: { id: lbl_heat_cur, text: "Ist --°", text_font: font_s, text_color: "${c_muted}", align: CENTER, y: 40 }
+        - button:
+            id: btn_heat_minus
+            align: BOTTOM_MID
+            x: -84
+            y: -76
+            width: 96
+            height: 50
+            bg_color: "${c_card}"
+            bg_opa: COVER
+            radius: 20
+            shadow_width: 0
+            on_click:
+              - lambda: |-
+                  float t = id(g_settemp) - 0.5; if (t < 5.0) t = 5.0; id(g_settemp) = t;
+              - lvgl.arc.update: { id: heat_arc, value: !lambda "return (int)(id(g_settemp) * 2);" }
+              - lvgl.label.update:
+                  id: lbl_heat_val
+                  text: !lambda |-
+                    char b[12]; snprintf(b, sizeof(b), "%.1f°", id(g_settemp)); return std::string(b);
+              - homeassistant.action:
+                  action: climate.set_temperature
+                  data:
+                    entity_id: climate.wandthermostat_jan_2
+                  variables:
+                    temp: !lambda "return id(g_settemp);"
+                  data_template:
+                    temperature: "{{ temp }}"
+            widgets:
+              - label: { text: "-", text_font: font_xxl, text_color: "${c_text}", align: CENTER }
+        - button:
+            id: btn_heat_plus
+            align: BOTTOM_MID
+            x: 84
+            y: -76
+            width: 96
+            height: 50
+            bg_color: "${c_card}"
+            bg_opa: COVER
+            radius: 20
+            shadow_width: 0
+            on_click:
+              - lambda: |-
+                  float t = id(g_settemp) + 0.5; if (t > 26.0) t = 26.0; id(g_settemp) = t;
+              - lvgl.arc.update: { id: heat_arc, value: !lambda "return (int)(id(g_settemp) * 2);" }
+              - lvgl.label.update:
+                  id: lbl_heat_val
+                  text: !lambda |-
+                    char b[12]; snprintf(b, sizeof(b), "%.1f°", id(g_settemp)); return std::string(b);
+              - homeassistant.action:
+                  action: climate.set_temperature
+                  data:
+                    entity_id: climate.wandthermostat_jan_2
+                  variables:
+                    temp: !lambda "return id(g_settemp);"
+                  data_template:
+                    temperature: "{{ temp }}"
+            widgets:
+              - label: { text: "+", text_font: font_xxl, text_color: "${c_text}", align: CENTER }
