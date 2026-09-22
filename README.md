@@ -14,7 +14,7 @@ Konfiguriert mit **ESPHome + LVGL**.
 
 ### ESP Home Device
 
-<img width="427" height="532" alt="Bildschirmfoto 2026-09-22 um 19 41 55" src="https://github.com/user-attachments/assets/d3dfc251-11b3-495e-b1c9-c77cbfd36747" />
+<img width="50%" height="auto" alt="Bildschirmfoto 2026-09-22 um 19 41 55" src="https://github.com/user-attachments/assets/d3dfc251-11b3-495e-b1c9-c77cbfd36747" /> <img width="49%" height="auto" alt="20260922_194427" src="https://github.com/user-attachments/assets/4c5f9732-9666-4121-bdf5-f989a0e7a28c" />
 
 ---
 
