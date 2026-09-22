@@ -12,6 +12,10 @@ Konfiguriert mit **ESPHome + LVGL**.
 
 <img width="1920" height="1249" alt="ESP-32-S3_4Zoll_Display (1)" src="https://github.com/user-attachments/assets/42aff703-ffe6-4202-a6b9-2d3cdce128ae" />
 
+### ESP Home Device
+
+<img width="427" height="532" alt="Bildschirmfoto 2026-09-22 um 19 41 55" src="https://github.com/user-attachments/assets/d3dfc251-11b3-495e-b1c9-c77cbfd36747" />
+
 ---
 
 ## Inhalt
