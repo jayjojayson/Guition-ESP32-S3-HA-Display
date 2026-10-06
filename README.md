@@ -33,6 +33,7 @@ Konfiguriert mit **ESPHome + LVGL**.
 11. [Nachrichten an das Display schicken (Popup)](#11-nachrichten-an-das-display-schicken)
 12. [Wie der Code aufgebaut ist](#12-wie-der-code-aufgebaut-ist)
 13. [Fehlersuche](#13-fehlersuche)
+14. [3.5 Zoll Display](#14-3-5-zoll-display)
 
 ---
 
@@ -377,5 +378,9 @@ Wer den Code erweitert, sollte diese Regel beibehalten.
 
 ---
 
-*Erstellt für die Weitergabe an andere Nutzer. Entitäten bitte an die eigene
-Installation anpassen.*
+## 14. 3-5 Zoll Display
+
+Ich habe auch noch ein 3.5 Zoll ESP32 S3 Display, was ich mit dem selben Code leicht angepasst ausgestattet habe. Ihr habt daher die Wahl für das 4 Zoll oder 3.5 Zoll Display, je nachdem welches Display ihr nutzt.
+
+<img width="1596" height="940" alt="image" src="https://github.com/user-attachments/assets/6f72128a-439d-435d-9790-4dd6eb29c84e" />
+
